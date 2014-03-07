@@ -81,14 +81,28 @@ var SauceLabsBrowser = function(id, args, sauceConnect, /* config.sauceLabs */ c
   this.id = id;
   this.name = browserName + ' on SauceLabs';
 
-  var pendingHeartBeat;
-  var heartbeat = function() {
-    pendingHeartBeat = setTimeout(function() {
+  var Heartbeat = function() {
+    var pendingTimeout = null;
+    var pendingDeffered = null;
+    var beat = function() {
       log.debug('Heartbeat to Sauce Labs (%s) - fetching title', browserName);
-      driver.title();
-      heartbeat();
-    }, 60000);
+      return  driver
+        .title()
+        .then(function() {
+          pendingDeffered = q.defer();
+          pendingTimeout = setTimeout(function() {
+            pendingDeffered.resolve(true);
+          }, 60000);
+          return pendingDeffered.promise;
+        }).then(function(again) { if(again) {return beat();} });
+    };
+    this.beat = beat;
+    this.stop = function() {
+      if(pendingTimeout) { clearTimeout(pendingTimeout); }
+      if(pendingDeffered) { pendingDeffered.resolve(false); }
+    };
   };
+  var heartbeat = new Heartbeat();
 
   var formatSauceError = function(err) {
     return err.message + '\n  ' + err.data.split('\n').shift();
@@ -121,26 +135,45 @@ var SauceLabsBrowser = function(id, args, sauceConnect, /* config.sauceLabs */ c
 
     url = url + '?id=' + id;
 
-    driver = wd.remote('ondemand.saucelabs.com', 80, username, accessKey);
-    driver.init(options, function(err, jobId) {
-      if (err) {
-        log.error('Can not start %s\n  %s', browserName, formatSauceError(err));
-        return emitter.emit('browser_process_failure', self);
-      }
+    driver = wd.promiseChainRemote('ondemand.saucelabs.com', 80, username, accessKey);
 
-      // Record the job details, so we can access it later with the reporter
-      jobMapping[id] = {
-        jobId: jobId,
-        credentials: {
-          username: username,
-          password: accessKey
-        }
-      };
-
-      log.info('%s session at https://saucelabs.com/tests/%s', browserName, driver.sessionID);
-      log.debug('WebDriver channel for %s instantiated, opening %s', browserName, url);
-      driver.get(url, heartbeat);
+    driver.on('status', function(info) {
+      log.debug(info.cyan);
     });
+    driver.on('command', function(eventType, command, response) {
+      log.debug(' > ' + eventType.cyan, command, (response || '').grey);
+    });
+    driver.on('http', function(meth, path, data) {
+      log.debug(' > ' + meth.magenta, path, (data || '').grey);
+    });
+
+
+    driver
+      .init(options)
+      .then(
+        function(jobId) {
+          // Record the job details, so we can access it later with the reporter
+          jobMapping[id] = {
+            jobId: jobId,
+            credentials: {
+              username: username,
+              password: accessKey
+            }
+          };
+
+          log.info('%s session at https://saucelabs.com/tests/%s', browserName, driver.sessionID);
+          log.debug('WebDriver channel for %s instantiated, opening %s', browserName, url);
+        }, function(err) {
+          log.error('Can not start %s\n  %s', browserName, formatSauceError(err));
+          throw new Error('Init failed.');
+        }
+      )
+      .get(url)
+      .then(function() { 
+        return heartbeat.beat(); })
+      .catch(function() {
+        emitter.emit('browser_process_failure', self);
+      }).done();
   };
 
   this.start = function(url) {
@@ -161,12 +194,13 @@ var SauceLabsBrowser = function(id, args, sauceConnect, /* config.sauceLabs */ c
       return process.nextTick(done);
     }
 
-    clearTimeout(pendingHeartBeat);
+    heartbeat.stop();
     log.debug('Shutting down the %s driver', browserName);
     // workaround - navigate to other page to avoid re-connection
-    driver.get('about:blank', function() {
-      driver.quit(done);
-    });
+    driver
+      .get('about:blank')
+      .quit(done)
+      .nodeify(done);
   };
 
   this.markCaptured = function() {
